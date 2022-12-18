@@ -1,0 +1,58 @@
+# -*- coding: UTF-8 -*-
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# Meta-data and dependencies
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+[project]
+name = "partis-pris"
+version = "0.0.1"
+description = "Experimental environment management"
+requires-python = ">= 3.6.2"
+dependencies = [
+  "packaging == 21.3",
+  "tomli >= 1.2.3",
+  # NOTE: 'importlib.metadata' not added to stdlib until 3.8
+  "importlib_metadata; python_version < '3.8'",
+  "click ~= 8.1.3",
+  "partis-pyproj >= 0.1.0",
+  "partis-utils >= 0.1.0" ]
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# Package CLI entry-points
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+[project.scripts]
+pris = "partis.pris.cli.cli:cli"
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# Build and distribution configuration
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+[build-system]
+requires = [
+  "partis-pyproj >= 0.1.0" ]
+
+build-backend = "partis.pyproj.backend"
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+[tool.pyproj.dist]
+ignore = [
+  '**/__pycache__',
+  '**/*.py[cod]',
+  '*.egg-info',
+  '**/.git',
+  '**/.github',
+  '**/.gitignore',
+  '**/.gitmodules' ]
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+[tool.pyproj.dist.source]
+copy = [
+  'src',
+  'pyproject.toml']
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# binary distribution installed paths
+
+[[tool.pyproj.dist.binary.purelib.copy]]
+src = 'src/partis-pris'
+dst = 'partis/pris'
+glob = '**/*.py'
