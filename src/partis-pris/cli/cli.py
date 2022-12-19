@@ -20,13 +20,15 @@ from partis.utils import (
 from ..env_spec import EnvSpec
 
 from .add import add
+from .config import config
+from .audit import audit
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 @click.group()
 #...............................................................................
 @click.option(
   '-v', '--verbosity',
-  help = f"log verbosity",
+  help = "Log verbosity",
   type = click.Choice(
     [ k.lower() for k in HINT_LEVELS_DESC.keys() ],
     case_sensitive = False ),
@@ -73,8 +75,9 @@ def cli(
     with_color = with_color,
     with_unicode = not ascii )
 
-  ctx.obj = EnvSpec()
-
-  ctx.meta['log'] = getLogger('partis.pris')
+  ctx.obj = EnvSpec(
+    logger = getLogger('partis.pris') )
 
 cli.add_command(add)
+cli.add_command(config)
+cli.add_command(audit)

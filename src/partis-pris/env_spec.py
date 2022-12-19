@@ -1,6 +1,25 @@
+import sys
+import os
+from pathlib import Path
 from collections.abc import (
   Iterable,
   Sequence )
+
+from partis.utils import (
+  getLogger,
+  branched_log,
+  checksum,
+  ModelHint,
+  ModelError,
+  Loc,
+  LogListHandler,
+  VirtualEnv,
+  MutexFile )
+
+DEFAULT_INDEX = 'https://pypi.org/simple'
+
+from .env_fs import (
+  Scheme )
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class Index:
@@ -13,11 +32,17 @@ class Index:
     return self.index
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-class EnvSpec:
+class EnvSpec(VirtualEnv):
   #-----------------------------------------------------------------------------
   def __init__(self,
+    path = None,
     explicit = None,
-    implicit = None ):
+    implicit = None,
+    **kwargs ):
+
+    super().__init__(
+      path = path if path else Path(sys.executable).parent.parent,
+      **kwargs )
 
     if explicit is None:
       explicit = tuple()
@@ -30,6 +55,13 @@ class EnvSpec:
 
     self._staged_add = list()
     self._staged_rm = list()
+
+    self._scheme = Scheme.from_sysconfig()
+
+  #-----------------------------------------------------------------------------
+  def audit(self):
+    self._scheme.audit(
+      manifest = self.path / 'pris_manifest.tgz')
 
   #-----------------------------------------------------------------------------
   @property
@@ -48,3 +80,4 @@ class EnvSpec:
   #-----------------------------------------------------------------------------
   def rm(self, reqs):
     self._staged_rm.extend(reqs)
+
