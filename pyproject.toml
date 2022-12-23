@@ -6,9 +6,10 @@
 [project]
 name = "partis-pris"
 version = "0.0.1"
-description = "Experimental environment management"
+description = "Experimental environment management (don't use)"
 requires-python = ">= 3.6.2"
 dependencies = [
+  "pypi_simple",
   "packaging == 21.3",
   "tomli >= 1.2.3",
   # NOTE: 'importlib.metadata' not added to stdlib until 3.8
