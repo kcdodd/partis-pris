@@ -64,7 +64,8 @@ from email.parser import HeaderParser
 from email.errors import MessageError
 import tarfile, zipfile
 from importlib import metadata
-import dataclasses
+from dataclasses import dataclass, field
+from typing import Optional
 
 from pypi_simple import PyPISimple, NoSuchProjectError, tqdm_progress_factory
 
@@ -79,12 +80,17 @@ import numpy as np
 from orjson import loads, dumps, JSONDecodeError
 import orjson
 
+from partis.pyproj import (
+  ValidationError,
+  norm_dist_name,
+  norm_dist_filename)
+
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 pkg_info_rec = re.compile(r'[\w.-]+/PKG-INFO')
 metadata_rec = re.compile(r'[\w.-]+\.dist-info/METADATA')
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-@dataclasses.dataclass
+@dataclass
 class IndexedPackage:
   name: str
   version: Version
@@ -93,12 +99,73 @@ class IndexedPackage:
   url: str
   digests: dict[str,str]
 
+  # only for binary distributions
+  tags: set[Tag] = field(init = False, default_factory = set)
+  build_number: tuple[int,str] = field(init = False, default = ())
+
   #-----------------------------------------------------------------------------
   def __post_init__(self):
-    self.version = self.version if isinstance(self.version, Version) else Version(self.version)
+    self.name = norm_dist_filename(norm_dist_name(self.name))
+
+    try:
+      self.version = (
+        self.version if isinstance(self.version, Version)
+        else Version(self.version) )
+
+    except InvalidVersion as e:
+      raise ValidationError(str(e)) from e
+
+    if self.dist == 'wheel':
+      try:
+        _,_, self.build_number, self.tags = parse_wheel_filename(self.filename)
+
+      except InvalidWheelFilename as e:
+        raise ValidationError(str(e)) from e
+
+    else:
+      self.build_number = None
+      self.tags = None
+
+  #-----------------------------------------------------------------------------
+  def __str__(self):
+    return f"{self.name}-{self.version}"
+
+  #-----------------------------------------------------------------------------
+  def __hash__(self):
+    return hash(str(self))
+
+  #-----------------------------------------------------------------------------
+  def __eq__(self, other):
+    return str(self) == str(other)
+
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-@dataclasses.dataclass
+@dataclass
+class Package(IndexedPackage):
+  file: Path
+  requires_python: SpecifierSet
+  dependencies: list[Requirement]
+
+  #-----------------------------------------------------------------------------
+  def __post_init__(self):
+    super().__post_init__()
+
+    self.file = Path(self.file)
+
+    if self.requires_python is None:
+      self.requires_python = SpecifierSet()
+
+    else:
+      self.requires_python = (
+        self.requires_python if isinstance(self.requires_python, SpecifierSet)
+        else SpecifierSet(self.requires_python) )
+
+    self.dependencies = [
+      r if isinstance(r, Requirement) else Requirement(r)
+      for r in self.dependencies ]
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+@dataclass
 class IndexedProject:
   name: str
   packages: list[IndexedPackage]
@@ -109,53 +176,37 @@ class IndexedProject:
       v if isinstance(v, IndexedPackage) else IndexedPackage(**v)
       for v in self.packages ]
 
-#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-@dataclasses.dataclass
-class Package:
-  name: str
-  version: Version
-  dist: str
-  file: Path
-  url: str
-  digests: dict[str,str]
-  reqs: list[Requirement]
-
   #-----------------------------------------------------------------------------
-  def __post_init__(self):
-    self.version = self.version if isinstance(self.version, Version) else Version(self.version)
-    self.file = Path(self.file)
-    self.reqs = [ r if isinstance(r, Requirement) else Requirement(r) for r in self.reqs ]
-
-
-#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-def dumper(obj):
-  if isinstance(obj, (Version, Requirement, Path)):
-    return str(obj)
-
-  raise TypeError
-
-#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-class Project:
-  #-----------------------------------------------------------------------------
-  def __init__(self, name, packages):
-    self.name = name
-    self.packages = packages
-
-    self.versions = {
-      v : pkg.reqs
-      for v, pkg in self.packages.items() }
-
-    # enumerate each version of the package.
-    # verions 'zero' is reserved to represent the 'absence' of the package
-    self.vmap = { v: i+1 for i, v in enumerate(self.versions.keys()) }
+  def __str__(self):
+    return self.name
 
   #-----------------------------------------------------------------------------
   def __hash__(self):
-    return hash(self.name)
+    return hash(str(self))
 
   #-----------------------------------------------------------------------------
   def __eq__(self, other):
-    return self.name == other.name
+    return str(self) == str(other)
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+@dataclass
+class Project(IndexedProject):
+  packages: list[Package]
+  vmap: dict[str, int] = field(init = False, default = None)
+
+  #-----------------------------------------------------------------------------
+  def __post_init__(self):
+
+    packages = [
+      v if isinstance(v, Package) else Package(**(
+        v.asdict() if hasattr(v, 'asdict') else v))
+      for v in self.packages ]
+
+    self.packages = sorted( packages, key = lambda v: v.version )
+
+    # enumerate each version of the package.
+    # verions 'zero' is reserved to represent the 'absence' of the package
+    self.vmap = { str(v.version): i+1 for i, v in enumerate(self.packages) }
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class MetadataNotFoundError(FileNotFoundError):
@@ -164,28 +215,63 @@ class MetadataNotFoundError(FileNotFoundError):
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class JsonBackedDict(dict):
   #-----------------------------------------------------------------------------
-  def __init__(self, file):
-    self.file = Path(file)
+  def __init__(self, file, errors_clear = False):
+    self.file = Path(file).resolve()
+    self.errors_clear = errors_clear
 
   #-----------------------------------------------------------------------------
-  def __enter__(self):
+  def pull(self):
     if self.file.exists():
       try:
         with open(self.file, 'rb') as fp:
           self.update(loads(fp.read()))
       except JSONDecodeError as e:
-        self.file.unlink()
+        # if failed, remove backing file to start over
+        if self.errors_clear:
+          self.file.unlink()
+        else:
+          raise
 
+  #-----------------------------------------------------------------------------
+  def push(self):
+
+    try:
+      file_tmp = self.file.parent / (self.file.name + '.tmp')
+
+      with open(file_tmp, 'wb') as fp:
+        fp.write(dumps(self, default = json_prep, option = orjson.OPT_INDENT_2))
+
+      file_tmp.replace(self.file)
+
+    except BaseException as e:
+      print(e)
+      if not self.errors_clear:
+        raise
+
+  #-----------------------------------------------------------------------------
+  def __enter__(self):
+    self.pull()
     return self
 
   #-----------------------------------------------------------------------------
   def __exit__(self, type, value, trace):
     if type is None:
-      with open(self.file, 'wb') as fp:
-        fp.write(dumps(self, default = dumper, option = orjson.OPT_INDENT_2))
+      # only save to backing file if there was no error to prevent saving
+      # potentially inconsistent state
+      self.push()
 
-    self.clear()
     return False
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+def json_prep(obj):
+
+  if isinstance(obj, (Version, Requirement, SpecifierSet, Path)):
+    return str(obj)
+
+  if isinstance(obj, (set, frozenset, Tag)):
+    return list(obj)
+
+  raise TypeError
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class PackageIndex:
@@ -205,9 +291,6 @@ class PackageIndex:
     self._tmp_cache_dir = cache_dir / 'tmp'
     self.tmp_cache_dir.mkdir(exist_ok = True)
 
-    self.manifest = JsonBackedDict(file = self.cache_dir / 'manifest.json')
-    self.indexed = JsonBackedDict(file = self.cache_dir / 'indexed.json')
-
   #-----------------------------------------------------------------------------
   @property
   def cache_dir(self):
@@ -226,11 +309,13 @@ class PackageIndex:
   #-----------------------------------------------------------------------------
   def query(self,
     requirements,
-    pkg_types = None,
+    dists = None,
     environment = None,
     tags = None,
     prereleases = False,
-    devreleases = False ):
+    devreleases = False,
+    tail = None,
+    refresh = False):
 
     if isinstance(requirements, (str, Requirement)):
       requirements = [requirements]
@@ -238,59 +323,72 @@ class PackageIndex:
     if environment is None:
       environment = default_environment()
 
-    projects = list()
+    py_version = Version(environment['python_version'])
 
-    if pkg_types is None:
-      pkg_types = [ 'wheel', 'sdist' ]
+    query_projects = list()
 
-    if 'wheel' in pkg_types:
+    if dists is None:
+      dists = [ 'wheel', 'sdist' ]
+
+    if 'wheel' in dists:
       if tags is None:
         tags = sys_tags()
 
       tags = set(tags)
 
     # print(f"For tags: {[ str(t) for t in tags ]}")
+    for req in requirements:
+      req = req if isinstance(req, Requirement) else Requirement(req)
 
-    with self.indexed as indexed, self.manifest as manifest:
-      for req in requirements:
-        req = req if isinstance(req, Requirement) else Requirement(req)
+      if req.marker and not req.marker.evaluate(environment):
+        continue
 
-        if req.marker and not req.marker.evaluate(environment):
-          continue
+      name = norm_dist_filename(norm_dist_name(req.name))
 
-        name = req.name
-        pkg_manifest = manifest.setdefault(name, {})
+      pkg_cache_dir = self.cache_dir / 'packages' / name
+      pkg_cache_dir.mkdir(parents = True, exist_ok = True)
 
-        pkg_cache_dir = self.cache_dir / 'packages' / name
-        pkg_cache_dir.mkdir(parents = True, exist_ok = True)
+      # caches info for all packages, whether or not they are downloaded
+      indexed = JsonBackedDict(
+        file = pkg_cache_dir / 'indexed.json',
+        errors_clear = True)
 
-        if name in indexed:
-          project = IndexedProject(**indexed[name])
+      # stores info for those packages that have been downloaed and analyzed
+      manifest = JsonBackedDict(
+        file = pkg_cache_dir / 'manifest.json',
+        errors_clear = True )
+
+      with indexed, manifest:
+
+        if name in indexed and not refresh:
+          # get from cached index package info
+          idx_proj = IndexedProject(**indexed[name])
 
         else:
           try:
             # TODO: handle retry multiple remotes, or from locals
             for remote in self.remotes:
               with PyPISimple(**remote) as client:
-                project = client.get_project_page(name)
+                idx_proj = client.get_project_page(name)
 
           except NoSuchProjectError:
             print(f"{name}: no index, skipping...")
             continue
 
-          packages = list()
+          # pypi_simple.DistributionPackage -> IndexPackage
+          idx_packages = list()
 
-          for pkg in project.packages:
+          for pkg in idx_proj.packages:
             if pkg.is_yanked:
+              # ??
+              continue
+
+            if not pkg.version:
+              # version couldn't be parsed from filename
               continue
 
             try:
-              version = Version(pkg.version)
-            except InvalidVersion as e:
-              print(f'  - error: {pkg.filename} -> {e}')
-              continue
-
-            packages.append(IndexedPackage(
+              idx_packages.append(IndexedPackage(
                 name = name,
                 version = pkg.version,
                 dist = pkg.package_type,
@@ -298,40 +396,45 @@ class PackageIndex:
                 url = pkg.url,
                 digests = pkg.digests))
 
-          project = IndexedProject(
-            name = name,
-            packages = packages)
-
-          indexed[name] = project
-
-        print(f"{name}: {len(project.packages)}")
-
-        packages = {}
-
-        for pkg in project.packages:
-
-          version = pkg.version
-
-          if not version:
-            continue
-
-          if pkg.dist not in pkg_types:
-            continue
-
-          if pkg.dist == 'wheel':
-            try:
-              _,_,_, pkg_tags = parse_wheel_filename(pkg.filename)
-            except InvalidWheelFilename as e:
+            except ValidationError as e:
+              # ignore these, probably indicates there are more issues
               print(f'  - error: {pkg.filename} -> {e}')
               continue
 
-            for tag in tags:
-              if tag in pkg_tags:
-                break
+          idx_proj = IndexedProject(
+            name = name,
+            packages = idx_packages)
 
-            else:
-              print(f'  - no tags: {[ str(t) for t in pkg_tags ]}')
-              continue
+          indexed[name] = idx_proj
+
+        print(f"{name}: {len(idx_proj.packages)}")
+
+        # filter by dist type
+        pkg_dists = [
+          pkg
+          for pkg in idx_proj.packages
+          if pkg.dist in dists ]
+
+        # NOTE: _dists is reversed so it is in *increasing* priority
+        _dists = dists[::-1]
+
+        # sort by dist type, and then by build number, so that packages are
+        # checked in the order of priority
+        pkg_dists = sorted(
+            pkg_dists,
+            key = lambda v: ( _dists.index(v.dist), v.build_number ),
+            reverse = True )
+
+        # Only analyze those of interest IndexPackage -> Package
+        query_packages = list()
+        query_versions = set()
+
+        for pkg in pkg_dists:
+          version = pkg.version
+
+          if version in query_versions:
+            # only keep the first package found for each desired version
+            continue
 
           if not prereleases and version.is_prerelease:
             continue
@@ -339,16 +442,24 @@ class PackageIndex:
           if not devreleases and version.is_devrelease:
             continue
 
-          if version in packages:
+          if req.specifier and version not in req.specifier:
+            print(f'  - not specifier: {pkg.filename} -> {version}')
             continue
 
-          if req.specifier and version not in req.specifier:
-            print(f'  - not in specifier: {pkg.filename} -> {version}')
-            continue
+          if pkg.dist == 'wheel':
+            # For binary distributions, make sure the tags
+            # accept if *any* package tag matches *any* desired tag
+            for tag in pkg.tags:
+              if tag in tags:
+                break
+
+            else:
+              print(f'  - not tags: {[ str(t) for t in pkg.tags ]}')
+              continue
 
           _version = str(version)
 
-          dl_manifest = pkg_manifest.setdefault(_version, {}).setdefault(pkg.dist, {})
+          dl_manifest = manifest.setdefault(_version, {}).setdefault(pkg.dist, {})
 
           if pkg.filename in dl_manifest:
             packages[version] = Package(**dl_manifest[pkg.filename])
@@ -425,42 +536,44 @@ class PackageIndex:
           try:
             txt = buf.decode('utf-8', errors = 'strict')
             py_req, reqs = parse_core_metadata_reqs(txt)
-            reqs = [Requirement(r) for r in reqs]
 
-            if py_req:
-              if Version(environment['python_version']) not in SpecifierSet(py_req):
-                continue
+            pkg = Package(
+              name = name,
+              version = version,
+              filename = file.name,
+              file = file,
+              dist = pkg.dist,
+              url = pkg.url,
+              digests = pkg.digests,
+              requires_python = py_req,
+              dependencies = reqs )
 
-          except (UnicodeError, MessageError, InvalidRequirement, InvalidSpecifier) as e:
+            dl_manifest[pkg.file.name] = pkg
+
+          except (ValidationError, UnicodeError, MessageError, InvalidRequirement, InvalidSpecifier) as e:
             print(f'    - error: {e}')
             file.unlink()
             continue
 
-          print(f'    - requirements: {len(reqs)}')
+          if pkg.requires_python and py_version not in pkg.requires_python:
+            print(f'    - not python: {py_req}')
+            continue
 
-          pkg = Package(
-            name = name,
-            version = version,
-            file = file,
-            dist = pkg.dist,
-            url = pkg.url,
-            digests = pkg.digests,
-            reqs = reqs )
+          print(f'    - requirements: {len(pkg.dependencies)}')
+          query_versions.add(version)
+          query_packages.append(pkg)
 
-          dl_manifest[pkg.file.name] = pkg
-          packages[version] = pkg
-
-        projects.append(Project(
+        query_projects.append(Project(
           name = name,
-          packages = packages))
+          packages = query_packages))
 
-    return projects
+    return query_projects
 
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 def prep(projects):
   npkg = len(projects)
-  nv = 1 + max(len(pkg.versions) for pkg in projects)
+  nv = 1 + max(len(proj.packages) for proj in projects)
   pnv = np.ones((npkg,), dtype = np.int32)
 
   # matrix encoding whether each version of each package violates a constraint
@@ -470,16 +583,18 @@ def prep(projects):
 
   pmap = { p.name : i for i, p in enumerate(projects) }
 
-  for pkg in projects:
+  for proj in projects:
     # enumerate all possible packages that could be installed
-    pidx = pmap[pkg.name]
-    pnv[pidx] = 1 + len(pkg.versions)
+    pidx = pmap[proj.name]
+    pnv[pidx] = 1 + len(proj.packages)
 
-    for version, deps in pkg.versions.items():
+    for pkg in proj.packages:
+      version = str(pkg.version)
+
       # get enuemrated index of each package version
       vidx = pkg.vmap[version]
 
-      for dep in deps:
+      for dep in pkg.dependencies:
         # if not dep.marker.evaluate():
         #   continue
 
