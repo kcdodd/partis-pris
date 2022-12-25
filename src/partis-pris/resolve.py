@@ -63,11 +63,13 @@ import re
 from email.parser import HeaderParser
 from email.errors import MessageError
 import tarfile, zipfile
+import hashlib
 from importlib import metadata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 from pypi_simple import PyPISimple, NoSuchProjectError, tqdm_progress_factory
+import requests
 
 from packaging.requirements import Requirement, InvalidRequirement
 from packaging.version import Version, InvalidVersion
@@ -90,6 +92,26 @@ pkg_info_rec = re.compile(r'[\w.-]+/PKG-INFO')
 metadata_rec = re.compile(r'[\w.-]+\.dist-info/METADATA')
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# @dataclass
+# class IndexedRequirement:
+#   name: str
+#   url: str
+#   extras: set[str]
+#   specifier: SpecifierSet
+#   marker: Optional[Marker]
+
+#   #-----------------------------------------------------------------------------
+#   def __post_init__(self):
+#     self.extras = set(self.extras)
+
+#     if not isinstance(self.specifier, SpecifierSet):
+#       self.specifier = SpecifierSet(self.specifier)
+
+#     if self.marker and not isinstance(self.marker, Marker)
+#       self.marker = Marker.__new__(Marker)
+#       self.marker._markers = self.marker
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 @dataclass
 class IndexedPackage:
   name: str
@@ -100,8 +122,8 @@ class IndexedPackage:
   digests: dict[str,str]
 
   # only for binary distributions
-  tags: set[Tag] = field(init = False, default_factory = set)
-  build_number: tuple[int,str] = field(init = False, default = ())
+  build_number: tuple[int,str]
+  tags: set[Tag]
 
   #-----------------------------------------------------------------------------
   def __post_init__(self):
@@ -116,15 +138,20 @@ class IndexedPackage:
       raise ValidationError(str(e)) from e
 
     if self.dist == 'wheel':
-      try:
-        _,_, self.build_number, self.tags = parse_wheel_filename(self.filename)
+      if not self.tags:
+        try:
+          _,_, self.build_number, self.tags = parse_wheel_filename(self.filename)
 
-      except InvalidWheelFilename as e:
-        raise ValidationError(str(e)) from e
+        except InvalidWheelFilename as e:
+          raise ValidationError(str(e)) from e
+
+      else:
+        self.build_number = tuple(self.build_number)
+        self.tags = set([t if isinstance(t, Tag) else Tag(*t) for t in self.tags])
 
     else:
-      self.build_number = None
-      self.tags = None
+      self.build_number = ()
+      self.tags = set()
 
   #-----------------------------------------------------------------------------
   def __str__(self):
@@ -138,6 +165,105 @@ class IndexedPackage:
   def __eq__(self, other):
     return str(self) == str(other)
 
+  #-----------------------------------------------------------------------------
+  def download(self, file, timeout = None):
+    file.parent.mkdir(parents = True, exist_ok = True)
+    file_tmp = file.parent / (file.name + '.tmp')
+
+    r_kwargs = dict(
+      url = self.url,
+      stream = True,
+      timeout = timeout )
+
+    for alg, digest_ref in self.digests.items():
+      try:
+        hasher = hashlib.new(alg)
+        break
+      except ValueError:
+        continue
+
+    else:
+      if self.digests:
+        raise ValidationError(f"Digests not supported: {list(self.digests.keys())}")
+
+      digest_ref = None
+      alg = 'sha256'
+      hasher = hashlib.sha256()
+
+    size = 0
+    bufsize = 2**16
+
+    try:
+      with requests.get(**r_kwargs) as r, file_tmp.open("wb") as fp:
+        for buf in r.iter_content(bufsize):
+          fp.write(buf)
+          hasher.update(buf)
+          size += len(buf)
+
+      digest = hasher.hexdigest()
+      file_tmp.replace(file)
+
+      if digest_ref and digest != digest_ref:
+        raise ValidationError(f"Invalid digest: {digest} != {digest_ref}")
+
+      return
+
+    except:
+      if file_tmp.exists():
+        file_tmp.unlink()
+
+      raise
+
+  #-----------------------------------------------------------------------------
+  def inspect(self, file, timeout = None):
+
+    buf = None
+
+    try:
+      if self.dist == 'sdist':
+
+        if file.suffix == '.zip':
+          with zipfile.ZipFile(file, mode = 'r') as fp:
+            for aname in fp.namelist():
+              if aname.count('/') == 1 and pkg_info_rec.fullmatch(aname):
+                buf = fp.read(aname)
+                break
+            else:
+              raise MetadataNotFoundError(f'PKG-INFO not found: {file.name}')
+
+        else:
+          with tarfile.open(file, mode = 'r:*', format = tarfile.PAX_FORMAT) as fp:
+            for aname in fp.getnames():
+              if aname.count('/') == 1 and pkg_info_rec.fullmatch(aname):
+                buf = fp.extractfile(aname).read()
+                break
+            else:
+              raise MetadataNotFoundError(f'PKG-INFO not found: {file.name}')
+      else:
+        # wheel
+        with zipfile.ZipFile(file, mode = 'r') as fp:
+          for aname in fp.namelist():
+            if aname.count('/') == 1 and metadata_rec.fullmatch(aname):
+              buf = fp.read(aname)
+              break
+          else:
+            raise MetadataNotFoundError(f'METADATA not found: {file.name}')
+
+    except (zipfile.BadZipFile, tarfile.TarError, MetadataNotFoundError) as e:
+      raise ValidationError(str(e)) from e
+
+    try:
+      txt = buf.decode('utf-8', errors = 'strict')
+      py_req, reqs = parse_core_metadata_reqs(txt)
+
+      return Package(
+        **asdict(self),
+        file = file,
+        requires_python = py_req,
+        dependencies = reqs )
+
+    except (ValidationError, UnicodeError, MessageError, InvalidRequirement, InvalidSpecifier) as e:
+      raise ValidationError(str(e)) from e
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 @dataclass
@@ -150,19 +276,23 @@ class Package(IndexedPackage):
   def __post_init__(self):
     super().__post_init__()
 
-    self.file = Path(self.file)
+    try:
+      self.file = Path(self.file)
 
-    if self.requires_python is None:
-      self.requires_python = SpecifierSet()
+      if self.requires_python is None:
+        self.requires_python = SpecifierSet()
 
-    else:
-      self.requires_python = (
-        self.requires_python if isinstance(self.requires_python, SpecifierSet)
-        else SpecifierSet(self.requires_python) )
+      else:
+        self.requires_python = (
+          self.requires_python if isinstance(self.requires_python, SpecifierSet)
+          else SpecifierSet(self.requires_python) )
 
-    self.dependencies = [
-      r if isinstance(r, Requirement) else Requirement(r)
-      for r in self.dependencies ]
+      self.dependencies = [
+        r if isinstance(r, Requirement) else Requirement(r)
+        for r in self.dependencies ]
+
+    except (ValueError, InvalidRequirement, InvalidSpecifier) as e:
+      raise ValidationError(str(e)) from e
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 @dataclass
@@ -192,21 +322,16 @@ class IndexedProject:
 @dataclass
 class Project(IndexedProject):
   packages: list[Package]
-  vmap: dict[str, int] = field(init = False, default = None)
 
   #-----------------------------------------------------------------------------
   def __post_init__(self):
 
     packages = [
       v if isinstance(v, Package) else Package(**(
-        v.asdict() if hasattr(v, 'asdict') else v))
+        asdict(v) if isinstance(v, IndexedProject) else v))
       for v in self.packages ]
 
     self.packages = sorted( packages, key = lambda v: v.version )
-
-    # enumerate each version of the package.
-    # verions 'zero' is reserved to represent the 'absence' of the package
-    self.vmap = { str(v.version): i+1 for i, v in enumerate(self.packages) }
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class MetadataNotFoundError(FileNotFoundError):
@@ -234,17 +359,20 @@ class JsonBackedDict(dict):
 
   #-----------------------------------------------------------------------------
   def push(self):
+    buf = dumps(self, default = json_prep, option = orjson.OPT_INDENT_2)
 
     try:
       file_tmp = self.file.parent / (self.file.name + '.tmp')
 
       with open(file_tmp, 'wb') as fp:
-        fp.write(dumps(self, default = json_prep, option = orjson.OPT_INDENT_2))
+        fp.write(buf)
 
       file_tmp.replace(self.file)
 
     except BaseException as e:
-      print(e)
+      if file_tmp.exists():
+        file_tmp.unlink()
+
       if not self.errors_clear:
         raise
 
@@ -268,8 +396,14 @@ def json_prep(obj):
   if isinstance(obj, (Version, Requirement, SpecifierSet, Path)):
     return str(obj)
 
-  if isinstance(obj, (set, frozenset, Tag)):
+  if isinstance(obj, (set, frozenset)):
     return list(obj)
+
+  if isinstance(obj, Tag):
+    return [obj.interpreter, obj.abi, obj.platform]
+
+  if isinstance(obj, Marker):
+    return list(obj._markers)
 
   raise TypeError
 
@@ -314,8 +448,9 @@ class PackageIndex:
     tags = None,
     prereleases = False,
     devreleases = False,
-    tail = None,
-    refresh = False):
+    top = None,
+    refresh = False,
+    timeout = None):
 
     if isinstance(requirements, (str, Requirement)):
       requirements = [requirements]
@@ -336,7 +471,6 @@ class PackageIndex:
 
       tags = set(tags)
 
-    # print(f"For tags: {[ str(t) for t in tags ]}")
     for req in requirements:
       req = req if isinstance(req, Requirement) else Requirement(req)
 
@@ -393,6 +527,8 @@ class PackageIndex:
                 version = pkg.version,
                 dist = pkg.package_type,
                 filename = pkg.filename,
+                build_number = None,
+                tags = None,
                 url = pkg.url,
                 digests = pkg.digests))
 
@@ -410,7 +546,7 @@ class PackageIndex:
         print(f"{name}: {len(idx_proj.packages)}")
 
         # filter by dist type
-        pkg_dists = [
+        query_dists = [
           pkg
           for pkg in idx_proj.packages
           if pkg.dist in dists ]
@@ -420,16 +556,16 @@ class PackageIndex:
 
         # sort by dist type, and then by build number, so that packages are
         # checked in the order of priority
-        pkg_dists = sorted(
-            pkg_dists,
-            key = lambda v: ( _dists.index(v.dist), v.build_number ),
-            reverse = True )
+        query_dists = sorted(
+          query_dists,
+          key = lambda v: ( v.version, _dists.index(v.dist), v.build_number ),
+          reverse = True )
 
         # Only analyze those of interest IndexPackage -> Package
         query_packages = list()
         query_versions = set()
 
-        for pkg in pkg_dists:
+        for pkg in query_dists:
           version = pkg.version
 
           if version in query_versions:
@@ -454,114 +590,48 @@ class PackageIndex:
                 break
 
             else:
-              print(f'  - not tags: {[ str(t) for t in pkg.tags ]}')
+              print(f'  - not tags: {pkg.filename} -> {[ str(t) for t in pkg.tags ]}')
               continue
 
           _version = str(version)
 
-          dl_manifest = manifest.setdefault(_version, {}).setdefault(pkg.dist, {})
-
-          if pkg.filename in dl_manifest:
-            packages[version] = Package(**dl_manifest[pkg.filename])
-            continue
+          _manifest = manifest.setdefault(_version, {}).setdefault(pkg.dist, {})
 
           dl_dir = pkg_cache_dir / str(version) / pkg.dist
           dl_dir.mkdir(parents = True, exist_ok = True)
           file = dl_dir / pkg.filename
-          file_tmp = self.tmp_cache_dir / pkg.filename
 
-          # fixup
-          # _dl_dir = pkg_cache_dir / str(version) / pkg.dist
-          # _dl_dir.mkdir(parents = True, exist_ok = True)
-          # _file = dl_dir / pkg.filename
-          # if _file.exists():
-          #   _file.replace(file)
-
-          method = 'cache' if file.exists() else 'download'
-          print(f"  - {name}, {version}: ({method}) {file.name}")
+          method = 'manifest' if pkg.filename in _manifest else ('cache' if file.exists() else 'download')
+          print(f"  - {name}, {version}: ({method}) {file.name}")\
 
           if not file.exists():
-            try:
-              with PyPISimple(**remote) as client:
-                client.download_package(
-                  pkg,
-                  file_tmp,
-                  progress = tqdm_progress_factory())
-
-              file_tmp.replace(file)
-
-            except:
-              if file_tmp.exists():
-                file_tmp.unlink()
-
-              raise
-
-          buf = None
+            pkg.download(file, timeout = timeout)
 
           try:
-            if pkg.dist == 'sdist':
+            if pkg.filename in _manifest:
+              pkg = Package(**_manifest[pkg.filename])
 
-              if file.suffix == '.zip':
-                with zipfile.ZipFile(file, mode = 'r') as fp:
-                  for aname in fp.namelist():
-                    if pkg_info_rec.fullmatch(aname):
-                      buf = fp.read(aname)
-                      break
-                  else:
-                    raise MetadataNotFoundError(f'PKG-INFO not found: {file.name}')
-
-              else:
-                with tarfile.open(file, mode = 'r:*', format = tarfile.PAX_FORMAT) as fp:
-                  for aname in fp.getnames():
-                    if pkg_info_rec.fullmatch(aname):
-                      buf = fp.extractfile(aname).read()
-                      break
-                  else:
-                    raise MetadataNotFoundError(f'PKG-INFO not found: {file.name}')
             else:
-              # wheel
-              with zipfile.ZipFile(file, mode = 'r') as fp:
-                for aname in fp.namelist():
-                  if metadata_rec.fullmatch(aname):
-                    buf = fp.read(aname)
-                    break
-                else:
-                  raise MetadataNotFoundError(f'METADATA not found: {file.name}')
+              pkg = pkg.inspect(file, timeout = timeout)
+              _manifest[pkg.file.name] = pkg
 
-          except (zipfile.BadZipFile, tarfile.TarError, MetadataNotFoundError) as e:
-            print(f'    - error: {e}')
-            file.unlink()
-            continue
+          except ValidationError as e:
+            print(f'    - invalid: {e}')
 
-          try:
-            txt = buf.decode('utf-8', errors = 'strict')
-            py_req, reqs = parse_core_metadata_reqs(txt)
-
-            pkg = Package(
-              name = name,
-              version = version,
-              filename = file.name,
-              file = file,
-              dist = pkg.dist,
-              url = pkg.url,
-              digests = pkg.digests,
-              requires_python = py_req,
-              dependencies = reqs )
-
-            dl_manifest[pkg.file.name] = pkg
-
-          except (ValidationError, UnicodeError, MessageError, InvalidRequirement, InvalidSpecifier) as e:
-            print(f'    - error: {e}')
+            _manifest.pop(pkg.filename, None)
             file.unlink()
             continue
 
           if pkg.requires_python and py_version not in pkg.requires_python:
-            print(f'    - not python: {py_req}')
+            print(f'    - not python: {pkg.requires_python}')
             continue
 
           print(f'    - requirements: {len(pkg.dependencies)}')
           query_versions.add(version)
           query_packages.append(pkg)
+
+          if top and len(query_versions) >= top:
+            break
 
         query_projects.append(Project(
           name = name,
@@ -583,6 +653,12 @@ def prep(projects):
 
   pmap = { p.name : i for i, p in enumerate(projects) }
 
+  # enumerate each version of the package.
+  # verions 'zero' is reserved to represent the 'absence' of the package
+  vmap = [
+    { str(v.version): i+1 for i, v in enumerate(p.packages) }
+    for p in projects ]
+
   for proj in projects:
     # enumerate all possible packages that could be installed
     pidx = pmap[proj.name]
@@ -592,7 +668,7 @@ def prep(projects):
       version = str(pkg.version)
 
       # get enuemrated index of each package version
-      vidx = pkg.vmap[version]
+      vidx = vmap[pidx][version]
 
       for dep in pkg.dependencies:
         # if not dep.marker.evaluate():
@@ -608,7 +684,7 @@ def prep(projects):
         # the absence of the dependency (version 'zero') violates constraint
         mnot[pidx, vidx, _pidx, 0] = True
 
-        for _version, _vidx in _pkg.vmap.items():
+        for _version, _vidx in vmap[_pidx].items():
           # compute whether this version violates a constraint
           compat = _version in dep.specifier
           mnot[pidx, vidx, _pidx, _vidx] = not compat
