@@ -58,38 +58,87 @@ form, and to enable more computationally efficient methods of finding a solution
 
 import os
 import os.path as osp
-from pathlib import Path
+from pathlib import (
+  Path,
+  PurePosixPath)
+from tempfile import TemporaryDirectory
 import re
 from email.parser import HeaderParser
 from email.errors import MessageError
 import tarfile, zipfile
 import hashlib
 from importlib import metadata
-from dataclasses import dataclass, field, asdict
+from dataclasses import (
+  dataclass,
+  field,
+  asdict)
 from typing import Optional
+from subprocess import CalledProcessError
 
-from pypi_simple import PyPISimple, NoSuchProjectError, tqdm_progress_factory
+from pypi_simple import (
+  PyPISimple,
+  NoSuchProjectError)
 import requests
-
-from packaging.requirements import Requirement, InvalidRequirement
-from packaging.version import Version, InvalidVersion
-from packaging.tags import Tag, parse_tag, sys_tags
-from packaging.specifiers import SpecifierSet, InvalidSpecifier
-from packaging.markers import Marker, UndefinedEnvironmentName, default_environment
-from packaging.utils import parse_wheel_filename, InvalidWheelFilename
-
+from packaging.requirements import (
+  Requirement,
+  InvalidRequirement)
+from packaging.version import (
+  Version,
+  InvalidVersion)
+from packaging.tags import (
+  Tag,
+  parse_tag,
+  sys_tags)
+from packaging.specifiers import (
+  SpecifierSet,
+  InvalidSpecifier)
+from packaging.markers import (
+  Marker,
+  UndefinedEnvironmentName,
+  default_environment)
+from packaging.utils import (
+  parse_wheel_filename,
+  InvalidWheelFilename)
 import numpy as np
-from orjson import loads, dumps, JSONDecodeError
+
+from orjson import (
+  loads,
+  dumps,
+  JSONDecodeError)
 import orjson
+import tomli
+
 
 from partis.pyproj import (
   ValidationError,
+  validating,
   norm_dist_name,
   norm_dist_filename)
+
+from partis.pyproj.pptoml import pptoml as PpToml
+
+from partis.utils import (
+  getLogger,
+  LogListHandler,
+  branched_log,
+  ModelHint,
+  VirtualEnv,
+  MutexFile )
+import logging
+
+from pyproject_hooks import (
+  BuildBackendHookCaller,
+  HookMissing )
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 pkg_info_rec = re.compile(r'[\w.-]+/PKG-INFO')
 metadata_rec = re.compile(r'[\w.-]+\.dist-info/METADATA')
+
+# from build.util import project_wheel_metadata
+# NOTE: as used by 'build'
+DEFAULT_BUILD_SYS = {
+  'build-backend': 'setuptools.build_meta:__legacy__',
+  'requires': ['setuptools >= 40.8.0', 'wheel'] }
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 # @dataclass
@@ -166,7 +215,24 @@ class IndexedPackage:
     return str(self) == str(other)
 
   #-----------------------------------------------------------------------------
+  def model_hint(self):
+    return ModelHint(
+      f"{self.name}-{self.version}",
+      hints = [
+        ModelHint('name', data = self.name),
+        ModelHint('version', data = self.version),
+        ModelHint('dist', data = self.dist),
+        ModelHint('filename', data = self.filename),
+        ModelHint('url', data = self.url),
+        ModelHint('build_number', data = self.build_number),
+        ModelHint('tags', data = self.tags),
+        ModelHint('digests', data = self.digests) ])
+
+  #-----------------------------------------------------------------------------
   def download(self, file, timeout = None):
+    """Downloads the indexed package to a local file
+    """
+
     file.parent.mkdir(parents = True, exist_ok = True)
     file_tmp = file.parent / (file.name + '.tmp')
 
@@ -215,32 +281,43 @@ class IndexedPackage:
       raise
 
   #-----------------------------------------------------------------------------
-  def inspect(self, file, timeout = None):
+  def inspect(self,
+    file,
+    environment,
+    log,
+    timeout = None):
+    """Inspects an indexed package using an already downloaded file.
+    """
 
-    buf = None
+    if self.dist == 'sdist':
 
-    try:
-      if self.dist == 'sdist':
+      with TemporaryDirectory() as dir:
+        dir = Path(dir)
 
-        if file.suffix == '.zip':
-          with zipfile.ZipFile(file, mode = 'r') as fp:
-            for aname in fp.namelist():
-              if aname.count('/') == 1 and pkg_info_rec.fullmatch(aname):
-                buf = fp.read(aname)
-                break
-            else:
-              raise MetadataNotFoundError(f'PKG-INFO not found: {file.name}')
+        try:
+          if file.suffix == '.zip':
+            with zipfile.ZipFile(file, mode = 'r') as fp:
+              top = archive_check_names(fp.namelist())
+              fp.extractall(dir)
 
-        else:
-          with tarfile.open(file, mode = 'r:*', format = tarfile.PAX_FORMAT) as fp:
-            for aname in fp.getnames():
-              if aname.count('/') == 1 and pkg_info_rec.fullmatch(aname):
-                buf = fp.extractfile(aname).read()
-                break
-            else:
-              raise MetadataNotFoundError(f'PKG-INFO not found: {file.name}')
-      else:
-        # wheel
+          else:
+            with tarfile.open(file, mode = 'r:*', format = tarfile.PAX_FORMAT) as fp:
+              top = archive_check_names(fp.getnames())
+              fp.extractall(dir)
+
+        except (zipfile.BadZipFile, tarfile.TarError) as e:
+          raise ValidationError(str(e)) from e
+
+        meta = project_wheel_metadata(
+          dir / next(iter(top)),
+          environment = environment,
+          log = log,
+          name = self.name,
+          version = self.version )
+
+    else:
+      # wheel
+      try:
         with zipfile.ZipFile(file, mode = 'r') as fp:
           for aname in fp.namelist():
             if aname.count('/') == 1 and metadata_rec.fullmatch(aname):
@@ -249,21 +326,63 @@ class IndexedPackage:
           else:
             raise MetadataNotFoundError(f'METADATA not found: {file.name}')
 
-    except (zipfile.BadZipFile, tarfile.TarError, MetadataNotFoundError) as e:
-      raise ValidationError(str(e)) from e
+      except (zipfile.BadZipFile, MetadataNotFoundError) as e:
+        raise ValidationError(str(e)) from e
 
-    try:
-      txt = buf.decode('utf-8', errors = 'strict')
-      py_req, reqs = parse_core_metadata_reqs(txt)
+      try:
+        txt = buf.decode('utf-8', errors = 'strict')
+        meta = HeaderParser().parsestr(txt)
 
-      return Package(
-        **asdict(self),
-        file = file,
-        requires_python = py_req,
-        dependencies = reqs )
+      except (UnicodeError, MessageError) as e:
+        raise ValidationError(str(e)) from e
 
-    except (ValidationError, UnicodeError, MessageError, InvalidRequirement, InvalidSpecifier) as e:
-      raise ValidationError(str(e)) from e
+
+    extras = meta.get_all('Provides-Extra') or list()
+    reqs = [
+      Requirement(req)
+      for req in meta.get_all('Requires-Dist') or list() ]
+
+    dependencies = list()
+    optional_dependencies = {k: list() for k in extras}
+
+    _env = {'extra': '', **environment}
+
+    for i, req in enumerate(reqs):
+      if not req.marker or req.marker.evaluate(_env):
+        reqs[i] = None
+        req.marker = None
+        dependencies.append(req)
+
+    for extra in extras:
+      reqs = [r for r in reqs if r]
+
+      for i, req in enumerate(reqs):
+        if req.marker.evaluate({'extra': extra, **environment}):
+          reqs[i] = None
+          req.marker = None
+          optional_dependencies[extra].append(req)
+
+    # TODO: save un-used requirements somewhere?
+    # reqs = [r for r in reqs if r]
+
+    pkg = Package(
+      name = meta.get('Name'),
+      version = meta.get('Version'),
+      dist = self.dist,
+      filename = file.name,
+      file = file,
+      url = self.url,
+      digests = self.digests,
+      build_number = self.build_number,
+      tags = self.tags,
+      requires_python = meta.get('Requires-Python'),
+      dependencies = dependencies,
+      optional_dependencies = optional_dependencies)
+
+    if pkg != self:
+      raise ValidationError(f"Package metadata does not match: {pkg} != {self}")
+
+    return pkg
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 @dataclass
@@ -271,6 +390,7 @@ class Package(IndexedPackage):
   file: Path
   requires_python: SpecifierSet
   dependencies: list[Requirement]
+  optional_dependencies: dict[str, list[Requirement]]
 
   #-----------------------------------------------------------------------------
   def __post_init__(self):
@@ -291,8 +411,39 @@ class Package(IndexedPackage):
         r if isinstance(r, Requirement) else Requirement(r)
         for r in self.dependencies ]
 
+      self.optional_dependencies = {
+        str(extra): [
+            r if isinstance(r, Requirement) else Requirement(r)
+            for r in deps ]
+          for extra, deps in self.optional_dependencies.items() }
+
     except (ValueError, InvalidRequirement, InvalidSpecifier) as e:
       raise ValidationError(str(e)) from e
+
+  #-----------------------------------------------------------------------------
+  def model_hint(self):
+    return ModelHint(
+      f"{self.name}-{self.version}",
+      hints = [
+        *super().model_hint().hints,
+        ModelHint('file', data = self.file),
+        ModelHint('requires_python', data = self.requires_python),
+        ModelHint(
+          'dependencies',
+          data = len(self.dependencies),
+          hints = [
+            ModelHint(data = dep)
+            for dep in self.dependencies ]),
+        ModelHint(
+          'optional-dependencies',
+          hints = [
+            ModelHint(
+              extra,
+              data = len(deps),
+              hints = [
+                ModelHint(data = dep)
+                for dep in deps] )
+            for extra, deps in self.optional_dependencies.items() ]) ])
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 @dataclass
@@ -412,7 +563,8 @@ class PackageIndex:
   #-----------------------------------------------------------------------------
   def __init__( self,
     cache_dir,
-    remotes = None ):
+    remotes = None,
+    log = None ):
 
     if remotes is None:
       remotes = [{}]
@@ -424,6 +576,8 @@ class PackageIndex:
 
     self._tmp_cache_dir = cache_dir / 'tmp'
     self.tmp_cache_dir.mkdir(exist_ok = True)
+
+    self.log = log or getLogger(__name__)
 
   #-----------------------------------------------------------------------------
   @property
@@ -450,6 +604,7 @@ class PackageIndex:
     devreleases = False,
     top = None,
     refresh = False,
+    audit = False,
     timeout = None):
 
     if isinstance(requirements, (str, Requirement)):
@@ -506,7 +661,7 @@ class PackageIndex:
                 idx_proj = client.get_project_page(name)
 
           except NoSuchProjectError:
-            print(f"{name}: no index, skipping...")
+            self.log.warn(f"{name}: no index, skipping...")
             continue
 
           # pypi_simple.DistributionPackage -> IndexPackage
@@ -534,7 +689,7 @@ class PackageIndex:
 
             except ValidationError as e:
               # ignore these, probably indicates there are more issues
-              print(f'  - error: {pkg.filename} -> {e}')
+              self.log.hint(e)
               continue
 
           idx_proj = IndexedProject(
@@ -542,8 +697,6 @@ class PackageIndex:
             packages = idx_packages)
 
           indexed[name] = idx_proj
-
-        print(f"{name}: {len(idx_proj.packages)}")
 
         # filter by dist type
         query_dists = [
@@ -565,6 +718,8 @@ class PackageIndex:
         query_packages = list()
         query_versions = set()
 
+        self.log.info(f"Query packages of `{idx_proj.name}`: {len(query_dists)}")
+
         for pkg in query_dists:
           version = pkg.version
 
@@ -572,65 +727,79 @@ class PackageIndex:
             # only keep the first package found for each desired version
             continue
 
-          if not prereleases and version.is_prerelease:
-            continue
+          with branched_log(
+            log = self.log,
+            name = f"inspect",
+            msg = f"Inspect package {pkg.dist}: {pkg.filename}" ) as inspect_log:
 
-          if not devreleases and version.is_devrelease:
-            continue
-
-          if req.specifier and version not in req.specifier:
-            print(f'  - not specifier: {pkg.filename} -> {version}')
-            continue
-
-          if pkg.dist == 'wheel':
-            # For binary distributions, make sure the tags
-            # accept if *any* package tag matches *any* desired tag
-            for tag in pkg.tags:
-              if tag in tags:
-                break
-
-            else:
-              print(f'  - not tags: {pkg.filename} -> {[ str(t) for t in pkg.tags ]}')
+            if not prereleases and version.is_prerelease:
+              inspect_log.warn(f'Not pre-releases: {pkg.filename} -> {version}')
               continue
 
-          _version = str(version)
+            if not devreleases and version.is_devrelease:
+              inspect_log.warn(f'Not dev-releases: {pkg.filename} -> {version}')
+              continue
 
-          _manifest = manifest.setdefault(_version, {}).setdefault(pkg.dist, {})
+            if req.specifier and version not in req.specifier:
+              inspect_log.warn(f'Not specifier: {pkg.filename} -> {version}')
+              continue
 
-          dl_dir = pkg_cache_dir / str(version) / pkg.dist
-          dl_dir.mkdir(parents = True, exist_ok = True)
-          file = dl_dir / pkg.filename
+            if pkg.dist == 'wheel':
+              # For binary distributions, make sure the tags
+              # accept if *any* package tag matches *any* desired tag
+              for tag in pkg.tags:
+                if tag in tags:
+                  break
 
-          method = 'manifest' if pkg.filename in _manifest else ('cache' if file.exists() else 'download')
-          print(f"  - {name}, {version}: ({method}) {file.name}")\
+              else:
+                inspect_log.warn(f'Not tags: {pkg.filename} -> {[ str(t) for t in pkg.tags ]}')
+                continue
 
-          if not file.exists():
-            pkg.download(file, timeout = timeout)
+            _version = str(version)
 
-          try:
-            if pkg.filename in _manifest:
-              pkg = Package(**_manifest[pkg.filename])
+            _manifest = manifest.setdefault(_version, {}).setdefault(pkg.dist, {})
 
-            else:
-              pkg = pkg.inspect(file, timeout = timeout)
-              _manifest[pkg.file.name] = pkg
+            dl_dir = pkg_cache_dir / str(version) / pkg.dist
+            dl_dir.mkdir(parents = True, exist_ok = True)
+            file = dl_dir / pkg.filename
 
-          except ValidationError as e:
-            print(f'    - invalid: {e}')
+            # method = 'manifest' if pkg.filename in _manifest else ('cache' if file.exists() else 'download')
+            # print(f"  - {name}, {version}: ({method}) {file.name}")\
 
-            _manifest.pop(pkg.filename, None)
-            file.unlink()
-            continue
+            if not file.exists():
+              pkg.download(file, timeout = timeout)
 
-          if pkg.requires_python and py_version not in pkg.requires_python:
-            print(f'    - not python: {pkg.requires_python}')
-            continue
+            try:
+              if pkg.filename in _manifest and not audit:
+                pkg = Package(**_manifest[pkg.filename])
 
-          print(f'    - requirements: {len(pkg.dependencies)}')
-          query_versions.add(version)
-          query_packages.append(pkg)
+              else:
+                pkg = pkg.inspect(
+                  file,
+                  environment = environment,
+                  log = inspect_log,
+                  timeout = timeout)
+
+                _manifest[pkg.file.name] = pkg
+
+            except ValidationError as e:
+              inspect_log.hint(e)
+
+              _manifest.pop(pkg.filename, None)
+              file.unlink()
+              continue
+
+            if pkg.requires_python and py_version not in pkg.requires_python:
+              inspect_log.warn(f'Not Python: {pkg.requires_python}')
+              continue
+
+            inspect_log.hint(pkg.model_hint())
+
+            query_versions.add(version)
+            query_packages.append(pkg)
 
           if top and len(query_versions) >= top:
+            self.log.debug(f"Top limit reached: {top}")
             break
 
         query_projects.append(Project(
@@ -779,8 +948,187 @@ def resolve(mnot, p0):
 
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-def parse_core_metadata_reqs(txt):
-  msg = HeaderParser().parsestr(txt)
-  reqs = msg.get_all('Requires-Dist') or list()
-  py_req = msg.get('Requires-Python')
-  return py_req, reqs
+# def parse_core_metadata(txt):
+#   msg = HeaderParser().parsestr(txt)
+#   # required fields
+#   name = msg.get('Name').strip()
+#   version = msg.get('Version').strip()
+#   meta_version = msg.get('Metadata-Version').strip()
+
+#   reqs = msg.get_all('Requires-Dist') or list()
+#   py_req = msg.get('Requires-Python')
+#   return name, version, meta_version, py_req, reqs
+
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+def archive_check_names(names):
+  top = set()
+
+  for name in names:
+    depth = 0
+    path = PurePosixPath(name)
+
+    if path.anchor:
+      raise ValidationError(f"Archive contains absolute path: {path}")
+
+    top.add(path.parts[0])
+
+    for p in path.parts:
+      depth += -1 if p == '..' else 1
+
+      if depth < 0:
+        raise ValidationError(f"Archive path extracts to outside of top directory: {path}")
+
+  return top
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+def project_wheel_metadata(
+  root,
+  log,
+  environment,
+  timeout = None,
+  name = None,
+  version = None ):
+
+  pptoml_file = root / 'pyproject.toml'
+
+  if pptoml_file.exists():
+    with open( pptoml_file, 'rb' ) as fp:
+      src = fp.read()
+      src = src.decode( 'utf-8', errors = 'replace' )
+      pptoml = tomli.loads( src )
+
+  else:
+    pptoml_file = None
+    pptoml = {}
+
+  if 'project' not in pptoml:
+    pptoml['project'] = {}
+
+  if 'name' not in pptoml['project']:
+    pptoml['project']['name'] = name if name else 'unknown'
+
+  if 'version' not in pptoml['project']:
+    pptoml['project']['version'] = version if version else '0.0.0'
+
+  if 'build-system' not in pptoml or not pptoml['build-system']:
+    pptoml['build-system'] = DEFAULT_BUILD_SYS
+
+  if 'build-backend' not in pptoml['build-system']:
+    pptoml['build-system']['build-backend'] = DEFAULT_BUILD_SYS['build-backend']
+
+  with validating(root = pptoml, file = pptoml_file):
+    pptoml = PpToml(pptoml)
+
+  project = pptoml.project
+  build_sys = pptoml.build_system
+
+  reqs = [
+    req
+    for req in [
+      Requirement(req)
+      for req in build_sys.requires ]
+    if not req.marker or req.marker.evaluate(environment) ]
+
+  for req in reqs:
+    req.marker = None
+
+  reqs = [ str(req) for req in reqs ]
+
+  log.hint(
+    'Prepare metadata',
+    hints = [
+      ModelHint('project.name', data = project.name),
+      ModelHint('project.version', data = project.version),
+      ModelHint('build-system.build-backend', data = build_sys.build_backend ),
+      ModelHint('build-system.backend-path', data = build_sys.backend_path),
+      ModelHint('build-system.requires', hints = reqs )])
+
+  with TemporaryDirectory() as build_dir:
+    build_dir = Path(build_dir)
+    env_dir = build_dir / 'venv'
+    wheel_dir = build_dir / 'wheel'
+
+    wheel_dir.mkdir(parents = True, exist_ok = True)
+
+    with VirtualEnv(
+      path = env_dir,
+      logger = log ) as env:
+
+      if reqs:
+        env.install(reqs)
+
+      hooks = BuildBackendHookCaller(
+        root,
+        build_backend = build_sys.build_backend,
+        backend_path = build_sys.backend_path,
+        runner = env.run_log,
+        python_executable = env.exec)
+
+      wheel_reqs = hooks.get_requires_for_build_wheel(
+        config_settings = None )
+
+      if wheel_reqs:
+        log.hint(
+          f'requires_for_build_wheel',
+          hints = wheel_reqs )
+
+        env.install(wheel_reqs)
+
+      try:
+        meta_dir = hooks.prepare_metadata_for_build_wheel(
+          wheel_dir,
+          config_settings = None,
+          _allow_fallback = False )
+
+        meta_dir = wheel_dir / meta_dir
+
+        for file in meta_dir.iterdir():
+          if file.name == 'METADATA':
+            with open(file, 'rb') as fp:
+              buf = fp.read()
+
+            break
+        else:
+          raise MetadataNotFoundError(f'METADATA not found: {meta_dir.name}')
+
+      except HookMissing as e1:
+        log.hint(
+          "Fallback to build_wheel",
+          level = 'info',
+          hints = e1 )
+
+        try:
+          wheel_file = hooks.build_wheel(
+            wheel_dir,
+            config_settings = None )
+
+          wheel_file = wheel_dir / wheel_file
+
+          try:
+            with zipfile.ZipFile(wheel_file, mode = 'r') as fp:
+              for aname in fp.namelist():
+                if aname.count('/') == 1 and metadata_rec.fullmatch(aname):
+                  buf = fp.read(aname)
+                  break
+              else:
+                raise MetadataNotFoundError(f'METADATA not found: {wheel_file.name}')
+
+          except zipfile.BadZipFile as e:
+            raise ValidationError(str(e)) from e
+
+        except CalledProcessError as e2:
+          log.hint(
+            "Failed to build wheel",
+            level = 'error',
+            hints = e2 )
+
+          raise ValidationError(str(e2)) from e2
+
+      try:
+        txt = buf.decode('utf-8', errors = 'strict')
+        meta = HeaderParser().parsestr(txt)
+        return meta
+
+      except (UnicodeError, MessageError) as e:
+        raise ValidationError(str(e)) from e
