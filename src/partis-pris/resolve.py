@@ -365,6 +365,11 @@ class IndexedPackage:
     # TODO: save un-used requirements somewhere?
     # reqs = [r for r in reqs if r]
 
+    optional_dependencies = {
+      extra : deps
+      for extra, deps in optional_dependencies.items()
+      if deps }
+
     pkg = Package(
       name = meta.get('Name'),
       version = meta.get('Version'),
@@ -733,15 +738,15 @@ class PackageIndex:
             msg = f"Inspect package {pkg.dist}: {pkg.filename}" ) as inspect_log:
 
             if not prereleases and version.is_prerelease:
-              inspect_log.warn(f'Not pre-releases: {pkg.filename} -> {version}')
+              inspect_log.detail(f'Not pre-releases: {pkg.filename} -> {version}')
               continue
 
             if not devreleases and version.is_devrelease:
-              inspect_log.warn(f'Not dev-releases: {pkg.filename} -> {version}')
+              inspect_log.detail(f'Not dev-releases: {pkg.filename} -> {version}')
               continue
 
             if req.specifier and version not in req.specifier:
-              inspect_log.warn(f'Not specifier: {pkg.filename} -> {version}')
+              inspect_log.detail(f'Not specifier: {pkg.filename} -> {version}')
               continue
 
             if pkg.dist == 'wheel':
@@ -752,16 +757,22 @@ class PackageIndex:
                   break
 
               else:
-                inspect_log.warn(f'Not tags: {pkg.filename} -> {[ str(t) for t in pkg.tags ]}')
+                inspect_log.detail(f'Not tags: {pkg.filename} -> {[ str(t) for t in pkg.tags ]}')
                 continue
 
             _version = str(version)
 
             _manifest = manifest.setdefault(_version, {}).setdefault(pkg.dist, {})
 
-            dl_dir = pkg_cache_dir / str(version) / pkg.dist
+            dl_dir = pkg_cache_dir / str(version)
             dl_dir.mkdir(parents = True, exist_ok = True)
             file = dl_dir / pkg.filename
+
+            # fixup
+            _dl_dir = pkg_cache_dir / str(version) / pkg.dist
+            _file = _dl_dir / pkg.filename
+            if _file.exists():
+              _file.replace(file)
 
             # method = 'manifest' if pkg.filename in _manifest else ('cache' if file.exists() else 'download')
             # print(f"  - {name}, {version}: ({method}) {file.name}")\
@@ -790,7 +801,7 @@ class PackageIndex:
               continue
 
             if pkg.requires_python and py_version not in pkg.requires_python:
-              inspect_log.warn(f'Not Python: {pkg.requires_python}')
+              inspect_log.detail(f'Not Python: {pkg.requires_python}')
               continue
 
             inspect_log.hint(pkg.model_hint())
@@ -799,7 +810,7 @@ class PackageIndex:
             query_packages.append(pkg)
 
           if top and len(query_versions) >= top:
-            self.log.debug(f"Top limit reached: {top}")
+            self.log.detail(f"Top limit reached: {top}")
             break
 
         query_projects.append(Project(
@@ -1065,8 +1076,17 @@ def project_wheel_metadata(
         runner = env.run_log,
         python_executable = env.exec)
 
-      wheel_reqs = hooks.get_requires_for_build_wheel(
-        config_settings = None )
+      try:
+        wheel_reqs = hooks.get_requires_for_build_wheel(
+          config_settings = None )
+
+      except CalledProcessError as e1:
+        log.hint(
+          "Failed to run get_requires_for_build_wheel",
+          level = 'error',
+          hints = e1 )
+
+        raise ValidationError(str(e1)) from e1
 
       if wheel_reqs:
         log.hint(
@@ -1091,6 +1111,14 @@ def project_wheel_metadata(
             break
         else:
           raise MetadataNotFoundError(f'METADATA not found: {meta_dir.name}')
+
+      except CalledProcessError as e1:
+        log.hint(
+          "Failed to run prepare_metadata_for_build_wheel",
+          level = 'error',
+          hints = e1 )
+
+        raise ValidationError(str(e1)) from e1
 
       except HookMissing as e1:
         log.hint(
@@ -1119,7 +1147,7 @@ def project_wheel_metadata(
 
         except CalledProcessError as e2:
           log.hint(
-            "Failed to build wheel",
+            "Failed to run build_wheel",
             level = 'error',
             hints = e2 )
 
