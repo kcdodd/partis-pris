@@ -16,7 +16,7 @@ dependencies = [
   "importlib_metadata; python_version < '3.8'",
   "click ~= 8.1.3",
   "partis-pyproj >= 0.1.0",
-  "partis-utils >= 0.1.0" ]
+  "partis-utils[asy] >= 0.1.0" ]
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 # Package CLI entry-points
