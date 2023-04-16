@@ -1,5 +1,10 @@
-Bootstrap: docker
-From: ubuntu:22.04
+Bootstrap: debootstrap
+OSVersion: jammy
+MirrorURL: http://us.archive.ubuntu.com/ubuntu/
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+%files
+  spack_config.yaml /opt/spack_config.yaml
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 %post
@@ -8,15 +13,38 @@ From: ubuntu:22.04
     ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
     echo $TZ > /etc/timezone
 
-  apt-get update
-  apt-get upgrade -y
-  apt-get install -y \
+  apt-get update && apt-get upgrade -y
+  apt-get install -y --no-install-recommends \
+    ca-certificates \
+    software-properties-common \
+    apt-transport-https \
     lsb-release \
-    python3-all-dev \
-    python3-pip \
-    python3-venv \
-    python3.10 \
-    python3.10-venv \
+    build-essential \
+    gfortran
+
+  add-apt-repository universe restricted multiverse
+  apt-get update
+
+  apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    tar \
+    zip \
+    gzip \
+    bzip2 \
+    unzip \
+    gnupg2 \
+    xz-utils \
+    zlib1g-dev \
+    lzma \
+    liblzma-dev \
+    libbz2-dev \
+    zstd \
+    libzstd-dev \
+    pigz \
+    libffi-dev
+
+  apt-get install -y --no-install-recommends \
     file \
     tcl \
     csh \
@@ -28,26 +56,11 @@ From: ubuntu:22.04
     tmux \
     patch \
     git \
-    tar \
-    zip \
-    gzip \
-    bzip2 \
-    unzip \
-    gnupg2 \
-    language-pack-en \
     libncurses5-dev \
-    xz-utils \
     mlocate \
     chrpath \
     patchelf \
-    golang \
-    build-essential \
-    llvm \
-    pkg-config \
     environment-modules \
-    munge \
-    slurm-wlm \
-    libssl-dev \
     uuid-dev \
     libgpgme11-dev \
     squashfs-tools \
@@ -64,34 +77,38 @@ From: ubuntu:22.04
     libpotrace-dev \
     libntirpc-dev \
     hwloc \
-    libffi-dev \
-    zlib1g-dev \
-    lzma \
-    liblzma-dev \
-    libbz2-dev \
-    zstd \
-    libzstd-dev \
-    pigz \
     libgl1 \
     libglew-dev \
     tk \
-    tk-dev \
-    libfftw3-dev \
-    texlive-latex-recommended \
-    texlive-latex-extra \
-    texlive-fonts-recommended \
-    texlive-fonts-extra \
-    texlive-science \
-    texlive-xetex \
-    biber \
-    fonts-freefont-otf \
-    latexmk \
-    xindy \
-    libcairo2 \
-    libcairo2-dev \
-    liblapack-dev \
-    libopenblas-dev \
-    libhdf5-dev
+    tk-dev
+
+  # apt-get install -y --no-install-recommends \
+  #   libfftw3-dev \
+  #   liblapack-dev \
+  #   libopenblas-dev \
+  #   libhdf5-dev
+
+  apt-get install -y --no-install-recommends \
+    python3-all-dev \
+    python3-pip \
+    python3-venv \
+    python3.10 \
+    python3.10-venv
+
+  # # apt-get install -y \
+  # #   language-pack-en \
+  # #   fonts-freefont-otf \
+  # #   texlive-latex-recommended \
+  # #   texlive-latex-extra \
+  # #   texlive-fonts-recommended \
+  # #   texlive-fonts-extra \
+  # #   texlive-science \
+  # #   texlive-xetex \
+  # #   biber \
+  # #   latexmk \
+  # #   xindy \
+  # #   libcairo2 \
+  # #   libcairo2-dev
 
   # make sure sh points to 'bash' instead of 'dash'
   ln -s /bin/bash /bin/sh.bash
@@ -101,3 +118,62 @@ From: ubuntu:22.04
   update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 0
   python3 --version
   python3 -m pip install --upgrade pip
+
+  # reduce unecessary files
+  apt-get remove -y software-properties-common apt-transport-https
+  apt-get autoremove -y
+  apt-get clean
+  rm -rf /var/lib/apt/lists/*
+  rm -rf /usr/share/doc/*
+  rm -rf /usr/share/man/*
+  rm -rf /var/cache/*
+
+
+#-------------------------------------------------------------------------------
+%appinstall venv
+  export SPACK_ROOT=/opt/spack
+  export PATH=$SPACK_ROOT/bin:$PATH
+
+  git clone --branch=releases/v0.19 --no-tags --single-branch --depth=1 -c feature.manyFiles=true https://github.com/spack/spack.git $SPACK_ROOT
+  mv /opt/spack_config.yaml $SPACK_ROOT/etc/spack/config.yaml
+
+  spack compiler find --scope system $(which gcc)
+  spack compiler find --scope system $(which g++)
+  spack compiler find --scope system $(which gfortran)
+
+#-------------------------------------------------------------------------------
+%appenv venv
+  export SPACK_ROOT=/opt/spack
+  export PATH=$SPACK_ROOT/bin:$PATH
+  export VENV=/venv
+  export VENV_SPACK=$VENV/spack
+  export VENV_PY=$VENV/py
+  export HOME=$VENV
+  export SHELL=/bin/bash
+
+#-------------------------------------------------------------------------------
+%apprun venv
+  source $SPACK_ROOT/share/spack/setup-env.sh
+
+  if [ ! -d "$VENV" ]; then
+    echo "Virtual environment base $VENV must be bound."
+    exit 1
+  fi
+
+  if [ ! -d "$VENV_SPACK" ]; then
+   spack env create -d $VENV_SPACK || spack env update -d $VENV_SPACK
+  fi
+
+  spack env activate -d $VENV_SPACK
+  spack install
+  spack load
+
+  if [ ! -d "$VENV_PY" ]; then
+   python3 -m venv $VENV_PY
+  fi
+
+  source $VENV_PY/bin/activate
+
+  # Execute the user's command (or start an interactive shell)
+  ${@:-bash}
+

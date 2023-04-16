@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from functools import partial
 from shlex import quote
 import trio
+import shutil
 from partis.utils.async_trio import (
   wait_all )
 
@@ -17,6 +18,18 @@ def total_size(path):
     return sum(total_size(p) for p in path.iterdir())
 
   return path.lstat().st_size
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+def replace(src: Path, dst: Path):
+  """An implementation of "replace" that doesn't fail on cross-device moves
+  """
+  dst = dst.resolve()
+  dst_tmp = (dst.parent / (dst.name + '.move_tmp'))
+  if dst_tmp.exists():
+    dst_tmp.unlink()
+
+  shutil.copy2(str(src), str(dst_tmp))
+  dst_tmp.replace(dst)
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class Overlay:
@@ -68,7 +81,7 @@ class Overlay:
           str(overlay_img)])
 
       self._out_dir.mkdir(parents = True, exist_ok = True)
-      overlay_img.replace(self._path)
+      replace(overlay_img, self._overlay_img)
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class Binding:
@@ -79,13 +92,21 @@ class Binding:
 
     self._host_path = Path(host_path)
     self._container_path = Path(container_path)
-    assert self._container_path.is_absolute()
+
+    if not self._container_path.is_absolute():
+      raise ValueError(
+        f"'container_path' must be absolute: {self._container_path}")
 
   #-----------------------------------------------------------------------------
   @property
   def bind(self):
-    assert self._host_path.is_dir()
-    return f"{self._host_path.resolve()}:{self._container_path}"
+    path = self._host_path.resolve()
+
+    if not path.is_dir():
+      raise ValueError(
+        f"'host_path' must be an existing directory: {path}")
+
+    return f"{path}:{self._container_path}"
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class Container:

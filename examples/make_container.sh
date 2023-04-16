@@ -7,4 +7,4 @@ fi
 
 NAME=$1
 
-sudo singularity build "${NAME}.sif" "${NAME}.def"
+sudo singularity build -F "${NAME}.sif" "${NAME}.def"

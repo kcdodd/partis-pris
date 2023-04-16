@@ -1,2 +1,4 @@
+*.img
 *.sif
 *.ext3
+venv/
