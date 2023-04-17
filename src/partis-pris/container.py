@@ -87,26 +87,29 @@ class Overlay:
 class Binding:
   #-----------------------------------------------------------------------------
   def __init__(self,
-      host_path: Path,
-      container_path: Path):
+      src: Path,
+      dst: Path,
+      writable: bool = False):
 
-    self._host_path = Path(host_path)
-    self._container_path = Path(container_path)
+    self._src = Path(src)
+    self._dst = Path(dst)
+    self._writable = bool(writable)
 
-    if not self._container_path.is_absolute():
+    if not self._dst.is_absolute():
       raise ValueError(
-        f"'container_path' must be absolute: {self._container_path}")
+        f"'dst' must be absolute: {self._dst}")
 
   #-----------------------------------------------------------------------------
   @property
   def bind(self):
-    path = self._host_path.resolve()
+    path = self._src.resolve()
 
     if not path.is_dir():
       raise ValueError(
-        f"'host_path' must be an existing directory: {path}")
+        f"'src' must be an existing directory: {path}")
 
-    return f"{path}:{self._container_path}"
+    opt = 'rw' if self._writable else 'ro'
+    return f"{path}:{self._dst}:{opt}"
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class Container:
@@ -118,8 +121,10 @@ class Container:
   #-----------------------------------------------------------------------------
   async def run(self,
       command = [],
+      app: str = None,
       overlays: list[Overlay] = [],
       bindings: list[Binding] = [],
+      env_pass: list[str] = [],
       env: dict[str,str] = {}):
 
     with TemporaryDirectory() as tmp:
@@ -127,7 +132,7 @@ class Container:
       env_file = tmp/'env_file.txt'
 
       env_file.write_text('\n'.join([
-        f"{k}='{quote(v)}'"
+        f"{k}='{quote(str(v))}'"
         for k,v in env.items()]))
 
       overlays = await wait_all([o.build(tmp) for o in overlays])
@@ -136,7 +141,9 @@ class Container:
         command = [
           'singularity',
           'exec',
+          *(['--app', app] if app else []),
           '--cleanenv',
+          '--env', f"\"{','.join([str(v) for v in env_pass])}\"",
           '--env-file', str(env_file),
           '--no-home',
           *[c for o in overlays for c in ['--overlay', str(o)]],

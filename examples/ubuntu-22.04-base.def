@@ -3,10 +3,6 @@ OSVersion: jammy
 MirrorURL: http://us.archive.ubuntu.com/ubuntu/
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-%files
-  spack_config.yaml /opt/spack_config.yaml
-
-#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 %post
   # To avoid being prompted during apt-get
   TZ=Etc/UTC && \
@@ -117,7 +113,6 @@ MirrorURL: http://us.archive.ubuntu.com/ubuntu/
   # good base python and pip version
   update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 0
   python3 --version
-  python3 -m pip install --upgrade pip
 
   # reduce unecessary files
   apt-get remove -y software-properties-common apt-transport-https
@@ -128,14 +123,24 @@ MirrorURL: http://us.archive.ubuntu.com/ubuntu/
   rm -rf /usr/share/man/*
   rm -rf /var/cache/*
 
+#-------------------------------------------------------------------------------
+%files
+  spack_config.yaml /opt/spack_config.yaml
+  spack_modules.yaml /opt/spack_modules.yaml
 
 #-------------------------------------------------------------------------------
 %appinstall venv
   export SPACK_ROOT=/opt/spack
   export PATH=$SPACK_ROOT/bin:$PATH
 
-  git clone --branch=releases/v0.19 --no-tags --single-branch --depth=1 -c feature.manyFiles=true https://github.com/spack/spack.git $SPACK_ROOT
+  git clone \
+    --branch=releases/v0.19 \
+    --no-tags --single-branch --depth=1 -c feature.manyFiles=true \
+    https://github.com/spack/spack.git \
+    $SPACK_ROOT
+
   mv /opt/spack_config.yaml $SPACK_ROOT/etc/spack/config.yaml
+  mv /opt/spack_modules.yaml $SPACK_ROOT/etc/spack/modules.yaml
 
   spack compiler find --scope system $(which gcc)
   spack compiler find --scope system $(which g++)
@@ -146,10 +151,10 @@ MirrorURL: http://us.archive.ubuntu.com/ubuntu/
   export SPACK_ROOT=/opt/spack
   export PATH=$SPACK_ROOT/bin:$PATH
   export VENV=/venv
-  export VENV_SPACK=$VENV/spack
-  export VENV_PY=$VENV/py
+  export VENV_PY=$VENV/.venv
   export HOME=$VENV
   export SHELL=/bin/bash
+  export PIP_CACHE_DIR=/venv/.cache/pip
 
 #-------------------------------------------------------------------------------
 %apprun venv
@@ -160,12 +165,8 @@ MirrorURL: http://us.archive.ubuntu.com/ubuntu/
     exit 1
   fi
 
-  if [ ! -d "$VENV_SPACK" ]; then
-   spack env create -d $VENV_SPACK || spack env update -d $VENV_SPACK
-  fi
-
-  spack env activate -d $VENV_SPACK
-  spack install
+  spack env activate -d $VENV || { spack env create -d $VENV && spack env activate -d $VENV; }
+  spack install -j 4
   spack load
 
   if [ ! -d "$VENV_PY" ]; then

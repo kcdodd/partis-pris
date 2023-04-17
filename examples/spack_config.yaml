@@ -17,7 +17,7 @@ config:
   # This is the path to the root of the Spack install tree.
   # You can use $spack here to refer to the root of the spack instance.
   install_tree:
-    root: /venv/avail
+    root: /venv/.spack_install
     projections:
       all: "{architecture}/{compiler.name}-{compiler.version}/{name}-{version}-{hash}"
     # install_tree can include an optional padded length (int or boolean)
@@ -72,20 +72,20 @@ config:
   # Directory in which to run tests and store test results.
   # Tests will be stored in directories named by date/time and package
   # name/hash.
-  test_stage: /venv/test
+  test_stage: /venv/.test/spack
 
   # Cache directory for already downloaded source tarballs and archived
   # repositories. This can be purged with `spack clean --downloads`.
-  source_cache: /venv/cache/download
+  source_cache: /venv/.cache/spack_download
 
 
   ## Directory where spack managed environments are created and stored
-  # environments_root: $spack/var/spack/environments
+  environments_root: /venv/.environments
 
 
   # Cache directory for miscellaneous files, like the package index.
   # This can be purged with `spack clean --misc-cache`
-  misc_cache: /venv/cache/misc
+  misc_cache: /venv/.cache/spack_misc
 
 
   # Timeout in seconds used for downloading sources etc. This only applies
